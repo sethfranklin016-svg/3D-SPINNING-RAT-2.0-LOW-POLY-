@@ -1,0 +1,454 @@
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_opengles2.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---------- Tiny vec3 helpers ----------
+typedef struct { float x, y, z; } vec3;
+static vec3 v3(float x, float y, float z) { vec3 r = {x,y,z}; return r; }
+static vec3 vadd(vec3 a, vec3 b) { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
+static vec3 vsub(vec3 a, vec3 b) { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
+static vec3 vmul(vec3 a, float s) { return v3(a.x*s, a.y*s, a.z*s); }
+static float vdot(vec3 a, vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static vec3 vcross(vec3 a, vec3 b) {
+    return v3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+}
+static vec3 vnorm(vec3 a) {
+    float l = sqrtf(vdot(a,a));
+    if (l < 1e-6f) return v3(0,0,0);
+    return v3(a.x/l, a.y/l, a.z/l);
+}
+
+// ---------- Vertex buffer (interleaved pos + color + normal) ----------
+// pos(3) + col(3) + nrm(3) = 9 floats
+static GLfloat *g_data = NULL;
+static size_t g_count = 0;   // number of floats
+static size_t g_cap = 0;
+
+static void push_vert(vec3 p, vec3 c, vec3 n) {
+    if (g_count + 9 > g_cap) {
+        g_cap = g_cap ? g_cap * 2 : 4096;
+        g_data = (GLfloat*)realloc(g_data, g_cap * sizeof(GLfloat));
+    }
+    g_data[g_count++] = p.x; g_data[g_count++] = p.y; g_data[g_count++] = p.z;
+    g_data[g_count++] = c.x; g_data[g_count++] = c.y; g_data[g_count++] = c.z;
+    g_data[g_count++] = n.x; g_data[g_count++] = n.y; g_data[g_count++] = n.z;
+}
+
+// ---------- Primitive builders (flat shaded) ----------
+// UV sphere: rings x segments. Flat shading = per-face normal.
+static void add_sphere(vec3 center, float radius, vec3 scale, vec3 color,
+                       int rings, int segs)
+{
+    for (int r = 0; r < rings; r++) {
+        float phi0 = (float)r     / rings * (float)M_PI;
+        float phi1 = (float)(r+1) / rings * (float)M_PI;
+        for (int s = 0; s < segs; s++) {
+            float th0 = (float)s     / segs * 2.0f * (float)M_PI;
+            float th1 = (float)(s+1) / segs * 2.0f * (float)M_PI;
+
+            vec3 p00 = v3(sinf(phi0)*cosf(th0), cosf(phi0), sinf(phi0)*sinf(th0));
+            vec3 p10 = v3(sinf(phi1)*cosf(th0), cosf(phi1), sinf(phi1)*sinf(th0));
+            vec3 p11 = v3(sinf(phi1)*cosf(th1), cosf(phi1), sinf(phi1)*sinf(th1));
+            vec3 p01 = v3(sinf(phi0)*cosf(th1), cosf(phi0), sinf(phi0)*sinf(th1));
+
+            // apply scale + translate
+            vec3 w00 = vadd(center, v3(p00.x*scale.x, p00.y*scale.y, p00.z*scale.z));
+            vec3 w10 = vadd(center, v3(p10.x*scale.x, p10.y*scale.y, p10.z*scale.z));
+            vec3 w11 = vadd(center, v3(p11.x*scale.x, p11.y*scale.y, p11.z*scale.z));
+            vec3 w01 = vadd(center, v3(p01.x*scale.x, p01.y*scale.y, p01.z*scale.z));
+
+            // Two triangles: (w00, w10, w11) and (w00, w11, w01)
+            vec3 t1n = vnorm(vcross(vsub(w10,w00), vsub(w11,w00)));
+            vec3 t2n = vnorm(vcross(vsub(w11,w00), vsub(w01,w00)));
+
+            push_vert(w00, color, t1n);
+            push_vert(w10, color, t1n);
+            push_vert(w11, color, t1n);
+
+            push_vert(w00, color, t2n);
+            push_vert(w11, color, t2n);
+            push_vert(w01, color, t2n);
+        }
+    }
+}
+
+// Cone / cylinder-ish: base circle at 'base', tip at 'tip'.
+static void add_cone(vec3 base, vec3 tip, float radius, vec3 color,
+                     int segs, vec3 squash)
+{
+    // squash lets us make an elliptical base (e.g. flat ear)
+    vec3 axis = vsub(tip, base);
+    vec3 up = vnorm(axis);
+    // pick any perpendicular
+    vec3 ref = (fabsf(up.y) < 0.9f) ? v3(0,1,0) : v3(1,0,0);
+    vec3 u = vnorm(vcross(up, ref));
+    vec3 v = vnorm(vcross(up, u));
+
+    for (int s = 0; s < segs; s++) {
+        float a0 = (float)s     / segs * 2.0f * (float)M_PI;
+        float a1 = (float)(s+1) / segs * 2.0f * (float)M_PI;
+        vec3 off0 = vadd(vmul(u, cosf(a0)*radius*squash.x),
+                         vmul(v, sinf(a0)*radius*squash.y));
+        vec3 off1 = vadd(vmul(u, cosf(a1)*radius*squash.x),
+                         vmul(v, sinf(a1)*radius*squash.y));
+        vec3 b0 = vadd(base, off0);
+        vec3 b1 = vadd(base, off1);
+        // side triangle
+        vec3 n = vnorm(vcross(vsub(b1,b0), vsub(tip,b0)));
+        push_vert(b0, color, n);
+        push_vert(b1, color, n);
+        push_vert(tip, color, n);
+        // base triangle (fan will be closed visually via backface cull off)
+        vec3 bn = vnorm(vmul(up, -1.0f));
+        push_vert(base, color, bn);
+        push_vert(b1, color, bn);
+        push_vert(b0, color, bn);
+    }
+}
+
+// Curved tube along a series of points (used for tail)
+static void add_tube(vec3 *pts, int n, float r0, float r1, vec3 color, int segs)
+{
+    for (int i = 0; i < n - 1; i++) {
+        vec3 a = pts[i], b = pts[i+1];
+        float t0 = (float)i / (n - 1);
+        float t1 = (float)(i+1) / (n - 1);
+        float ra = r0 + (r1 - r0) * t0;
+        float rb = r0 + (r1 - r0) * t1;
+
+        vec3 axis = vnorm(vsub(b, a));
+        vec3 ref = (fabsf(axis.y) < 0.9f) ? v3(0,1,0) : v3(1,0,0);
+        vec3 u = vnorm(vcross(axis, ref));
+        vec3 v = vnorm(vcross(axis, u));
+
+        for (int s = 0; s < segs; s++) {
+            float aa = (float)s     / segs * 2.0f * (float)M_PI;
+            float ab = (float)(s+1) / segs * 2.0f * (float)M_PI;
+            vec3 oa0 = vadd(vmul(u, cosf(aa)), vmul(v, sinf(aa)));
+            vec3 oa1 = vadd(vmul(u, cosf(ab)), vmul(v, sinf(ab)));
+
+            vec3 p00 = vadd(a, vmul(oa0, ra));
+            vec3 p01 = vadd(a, vmul(oa1, ra));
+            vec3 p10 = vadd(b, vmul(oa0, rb));
+            vec3 p11 = vadd(b, vmul(oa1, rb));
+
+            vec3 n1 = vnorm(vcross(vsub(p10,p00), vsub(p11,p00)));
+            push_vert(p00, color, n1);
+            push_vert(p10, color, n1);
+            push_vert(p11, color, n1);
+
+            vec3 n2 = vnorm(vcross(vsub(p11,p00), vsub(p01,p00)));
+            push_vert(p00, color, n2);
+            push_vert(p11, color, n2);
+            push_vert(p01, color, n2);
+        }
+    }
+}
+
+// ---------- Rat ----------
+static void build_rat(void)
+{
+    vec3 fur   = v3(0.55f, 0.50f, 0.45f);  // warm grey
+    vec3 fur2  = v3(0.42f, 0.38f, 0.34f);  // darker belly
+    vec3 pink  = v3(0.95f, 0.55f, 0.65f);  // ears / tail / nose
+    vec3 black = v3(0.05f, 0.05f, 0.05f);
+    vec3 white = v3(0.95f, 0.95f, 0.95f);
+
+    // Body — stretched sphere, low segments for low-poly look
+    add_sphere(v3(0.0f, 0.0f, 0.0f), 1.0f, v3(0.75f, 0.55f, 0.55f), fur, 7, 10);
+
+    // Rump bump (slightly higher at back)
+    add_sphere(v3(-0.55f, 0.12f, 0.0f), 1.0f, v3(0.30f, 0.35f, 0.35f), fur, 6, 8);
+
+    // Head
+    vec3 head_c = v3(0.70f, 0.15f, 0.0f);
+    add_sphere(head_c, 1.0f, v3(0.38f, 0.34f, 0.32f), fur, 6, 8);
+
+    // Snout (cone pointing forward +x)
+    add_cone(v3(0.95f, 0.05f, 0.0f), v3(1.28f, -0.02f, 0.0f),
+             0.18f, fur2, 8, v3(1.0f, 0.9f, 0.9f));
+
+    // Nose (tiny pink sphere at tip)
+    add_sphere(v3(1.28f, -0.02f, 0.0f), 1.0f, v3(0.06f, 0.05f, 0.05f), pink, 4, 6);
+
+    // Eyes
+    add_sphere(v3(1.02f, 0.22f,  0.20f), 1.0f, v3(0.055f, 0.055f, 0.055f), black, 4, 6);
+    add_sphere(v3(1.02f, 0.22f, -0.20f), 1.0f, v3(0.055f, 0.055f, 0.055f), black, 4, 6);
+    // Eye glints
+    add_sphere(v3(1.04f, 0.25f,  0.22f), 1.0f, v3(0.018f, 0.018f, 0.018f), white, 3, 4);
+    add_sphere(v3(1.04f, 0.25f, -0.18f), 1.0f, v3(0.018f, 0.018f, 0.018f), white, 3, 4);
+
+    // Ears — flattened cones, tilted outward and up
+    add_cone(v3(0.75f, 0.40f,  0.28f), v3(0.72f, 0.72f,  0.48f),
+             0.20f, pink, 8, v3(1.0f, 0.35f, 1.0f));
+    add_cone(v3(0.75f, 0.40f, -0.28f), v3(0.72f, 0.72f, -0.48f),
+             0.20f, pink, 8, v3(1.0f, 0.35f, 1.0f));
+
+    // Legs — short tapered tubes
+    // Front left
+    add_cone(v3( 0.45f, -0.35f,  0.22f), v3( 0.45f, -0.85f,  0.22f),
+             0.10f, fur2, 6, v3(1,1,1));
+    // Front right
+    add_cone(v3( 0.45f, -0.35f, -0.22f), v3( 0.45f, -0.85f, -0.22f),
+             0.10f, fur2, 6, v3(1,1,1));
+    // Back left
+    add_cone(v3(-0.45f, -0.35f,  0.22f), v3(-0.45f, -0.85f,  0.22f),
+             0.11f, fur2, 6, v3(1,1,1));
+    // Back right
+    add_cone(v3(-0.45f, -0.35f, -0.22f), v3(-0.45f, -0.85f, -0.22f),
+             0.11f, fur2, 6, v3(1,1,1));
+
+    // Tail — tube curving back and up
+    vec3 tail_pts[] = {
+        v3(-0.85f, -0.05f, 0.0f),
+        v3(-1.15f,  0.02f, 0.08f),
+        v3(-1.40f,  0.18f, 0.20f),
+        v3(-1.60f,  0.42f, 0.28f),
+        v3(-1.72f,  0.72f, 0.24f),
+        v3(-1.75f,  1.00f, 0.10f),
+    };
+    add_tube(tail_pts, 6, 0.07f, 0.02f, pink, 6);
+
+    // Whiskers — thin cones off the snout (a few, just for character)
+    add_cone(v3(1.20f, 0.02f,  0.05f), v3(1.55f,  0.15f,  0.25f),
+             0.012f, black, 4, v3(1,1,1));
+    add_cone(v3(1.20f, 0.02f,  0.05f), v3(1.58f,  0.02f,  0.28f),
+             0.012f, black, 4, v3(1,1,1));
+    add_cone(v3(1.20f, 0.02f, -0.05f), v3(1.55f,  0.15f, -0.25f),
+             0.012f, black, 4, v3(1,1,1));
+    add_cone(v3(1.20f, 0.02f, -0.05f), v3(1.58f,  0.02f, -0.28f),
+             0.012f, black, 4, v3(1,1,1));
+}
+
+// ---------- 4x4 matrix (column-major, matches GL) ----------
+static void mat_identity(float *m) {
+    memset(m, 0, 16*sizeof(float));
+    m[0]=m[5]=m[10]=m[15]=1.0f;
+}
+
+static void mat_perspective(float *m, float fovy, float aspect,
+                            float znear, float zfar)
+{
+    float f = 1.0f / tanf(fovy * 0.5f);
+    memset(m, 0, 16*sizeof(float));
+    m[0]  = f / aspect;
+    m[5]  = f;
+    m[10] = (zfar + znear) / (znear - zfar);
+    m[11] = -1.0f;
+    m[14] = (2.0f * zfar * znear) / (znear - zfar);
+}
+
+static void mat_lookat(float *m, vec3 eye, vec3 center, vec3 up)
+{
+    vec3 f = vnorm(vsub(center, eye));
+    vec3 s = vnorm(vcross(f, up));
+    vec3 u = vcross(s, f);
+
+    m[0]=s.x; m[4]=s.y; m[8] =s.z; m[12]=-vdot(s,eye);
+    m[1]=u.x; m[5]=u.y; m[9] =u.z; m[13]=-vdot(u,eye);
+    m[2]=-f.x; m[3]=-f.y; m[6]=-f.z; m[7]=vdot(f,eye);
+    m[8]=0; m[9]=0; m[10]=0; m[11]=1;
+    // fix: rebuild properly
+    m[0]=s.x;  m[1]=u.x;  m[2]=-f.x;  m[3]=0;
+    m[4]=s.y;  m[5]=u.y;  m[6]=-f.y;  m[7]=0;
+    m[8]=s.z;  m[9]=u.z;  m[10]=-f.z; m[11]=0;
+    m[12]=-vdot(s,eye); m[13]=-vdot(u,eye); m[14]=vdot(f,eye); m[15]=1.0f;
+}
+
+static void mat_rotate_y(float *m, float angle)
+{
+    float c = cosf(angle), s = sinf(angle);
+    mat_identity(m);
+    m[0]=c;  m[2]=-s;
+    m[8]=s;  m[10]=c;
+}
+
+static void mat_translate(float *m, vec3 t)
+{
+    mat_identity(m);
+    m[12]=t.x; m[13]=t.y; m[14]=t.z;
+}
+
+static void mat_mul(float *out, const float *a, const float *b)
+{
+    float r[16];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            float sum = 0;
+            for (int k = 0; k < 4; k++)
+                sum += a[k*4 + j] * b[i*4 + k];
+            r[i*4 + j] = sum;
+        }
+    memcpy(out, r, sizeof(r));
+}
+
+// ---------- Shader helpers ----------
+static GLuint mk_shader(GLenum type, const char *src)
+{
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetShaderInfoLog(s, sizeof(log), NULL, log);
+        fprintf(stderr, "Shader error: %s\n", log);
+    }
+    return s;
+}
+
+// ---------- Main ----------
+int main(int argc, char *argv[])
+{
+    SDL_Init(SDL_INIT_EVERYTHING);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+
+    SDL_DisplayMode dm;
+    SDL_GetCurrentDisplayMode(0, &dm);
+
+    SDL_Window *window = SDL_CreateWindow("Rat",
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        dm.w, dm.h,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
+    SDL_GL_CreateContext(window);
+
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+    // Build geometry
+    build_rat();
+    int vert_count = (int)(g_count / 9);
+
+    const char *vs =
+        "attribute vec3 a_pos;\n"
+        "attribute vec3 a_col;\n"
+        "attribute vec3 a_nrm;\n"
+        "uniform mat4 u_mvp;\n"
+        "uniform mat4 u_model;\n"
+        "varying vec3 v_col;\n"
+        "varying vec3 v_nrm;\n"
+        "void main() {\n"
+        "    v_col = a_col;\n"
+        "    v_nrm = mat3(u_model) * a_nrm;\n"  // mat3 not valid in GLES2? see note
+        "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+        "}\n";
+
+    // GLES2 doesn't support mat3(mat4) constructor; do it manually
+    const char *vs_fixed =
+        "attribute vec3 a_pos;\n"
+        "attribute vec3 a_col;\n"
+        "attribute vec3 a_nrm;\n"
+        "uniform mat4 u_mvp;\n"
+        "uniform mat4 u_model;\n"
+        "varying vec3 v_col;\n"
+        "varying vec3 v_nrm;\n"
+        "void main() {\n"
+        "    v_col = a_col;\n"
+        "    v_nrm = normalize(vec3(u_model * vec4(a_nrm, 0.0)));\n"
+        "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+        "}\n";
+
+    const char *fs =
+        "precision mediump float;\n"
+        "varying vec3 v_col;\n"
+        "varying vec3 v_nrm;\n"
+        "void main() {\n"
+        "    vec3 L = normalize(vec3(0.5, 0.8, 0.6));\n"
+        "    float d = max(dot(normalize(v_nrm), L), 0.0);\n"
+        "    float amb = 0.35;\n"
+        "    gl_FragColor = vec4(v_col * (amb + 0.75 * d), 1.0);\n"
+        "}\n";
+
+    (void)vs; // suppress unused warning
+
+    GLuint v = mk_shader(GL_VERTEX_SHADER, vs_fixed);
+    GLuint f = mk_shader(GL_FRAGMENT_SHADER, fs);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, v);
+    glAttachShader(prog, f);
+    glLinkProgram(prog);
+    GLint linked; glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[1024];
+        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+        fprintf(stderr, "Link error: %s\n", log);
+    }
+
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, g_count * sizeof(GLfloat), g_data, GL_STATIC_DRAW);
+
+    GLint a_pos = glGetAttribLocation(prog, "a_pos");
+    GLint a_col = glGetAttribLocation(prog, "a_col");
+    GLint a_nrm = glGetAttribLocation(prog, "a_nrm");
+    GLint u_mvp = glGetUniformLocation(prog, "u_mvp");
+    GLint u_model = glGetUniformLocation(prog, "u_model");
+
+    int stride = 9 * sizeof(GLfloat);
+    glEnableVertexAttribArray(a_pos);
+    glEnableVertexAttribArray(a_col);
+    glEnableVertexAttribArray(a_nrm);
+    glVertexAttribPointer(a_pos, 3, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glVertexAttribPointer(a_col, 3, GL_FLOAT, GL_FALSE, stride, (void*)(3*sizeof(GLfloat)));
+    glVertexAttribPointer(a_nrm, 3, GL_FLOAT, GL_FALSE, stride, (void*)(6*sizeof(GLfloat)));
+
+    Uint32 start = SDL_GetTicks();
+    int running = 1;
+    while (running)
+    {
+        SDL_Event e;
+        while (SDL_PollEvent(&e))
+            if (e.type == SDL_QUIT) running = 0;
+
+        int w, h;
+        SDL_GL_GetDrawableSize(window, &w, &h);
+        glViewport(0, 0, w, h);
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glUseProgram(prog);
+
+        float t = (SDL_GetTicks() - start) / 1000.0f;
+
+        // Build matrices: perspective * view * model
+        float proj[16], view[16], model[16], viewmodel[16], mvp[16];
+        mat_perspective(proj, 50.0f * (float)M_PI / 180.0f,
+                        (float)w / (float)h, 0.1f, 50.0f);
+
+        // Place rat so it fits nicely (rat spans roughly -1.8..1.3 in x)
+        vec3 eye    = v3(2.2f, 1.4f, 3.2f);
+        vec3 center = v3(0.0f, 0.0f, 0.0f);
+        vec3 up     = v3(0.0f, 1.0f, 0.0f);
+        mat_lookat(view, eye, center, up);
+
+        mat_rotate_y(model, t * 0.6f);      // slow spin
+        // (rotation about origin — rat is roughly centered)
+
+        mat_mul(viewmodel, view, model);
+        mat_mul(mvp, proj, viewmodel);
+
+        glUniformMatrix4fv(u_mvp, 1, GL_FALSE, mvp);
+        glUniformMatrix4fv(u_model, 1, GL_FALSE, model);
+
+        glDrawArrays(GL_TRIANGLES, 0, vert_count);
+        SDL_GL_SwapWindow(window);
+    }
+
+    free(g_data);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}
